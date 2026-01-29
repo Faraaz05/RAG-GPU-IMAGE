@@ -34,6 +34,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY requirements-missing.txt .
 RUN pip install --no-cache-dir -r requirements-missing.txt
 
+RUN python3 -m pip uninstall -y pdfminer pdfminer-six
+
+COPY other.txt .
+RUN python3 -m pip install --no-cache-dir -r other.txt
 
 COPY warmup.py .
 COPY test_complex.pdf .
