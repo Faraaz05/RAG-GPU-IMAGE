@@ -1,3 +1,11 @@
+# Missing dependencies for unstructured PDF processing
 pdf2image
 pdfminer.six==20260107
 unstructured-pytesseract==0.3.13
+pdfplumber
+pypdf==4.2.0
+pytesseract==0.3.13
+opencv-python-headless==4.9.0.80
+pi-heif==0.17.0
+unstructured_inference
+redis==5.0.1

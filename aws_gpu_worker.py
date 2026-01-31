@@ -1,6 +1,6 @@
 """
-AWS Batch GPU Worker for Vector Trace
-Processes a single document and exits.
+ECS GPU Worker for Vector Trace
+Long-running worker that processes documents from a queue.
 """
 import json
 import logging
@@ -11,6 +11,8 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import List, Dict
+from concurrent.futures import ProcessPoolExecutor
+import time
 
 from dotenv import load_dotenv
 load_dotenv('/app/.env')
@@ -28,6 +30,90 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import chromadb
+
+# Queue backends
+import boto3
+import redis
+
+# --- QUEUE ABSTRACTIONS ---
+class QueueBackend:
+    def send(self, payload: dict):
+        raise NotImplementedError
+    
+    def receive(self, max_messages: int = 1):
+        raise NotImplementedError
+    
+    def ack(self, message):
+        raise NotImplementedError
+
+class RedisQueue(QueueBackend):
+    def __init__(self, host='localhost', port=6379, db=0, queue_name='document_jobs'):
+        self.redis = redis.Redis(host=host, port=port, db=db)
+        self.queue_name = queue_name
+    
+    def send(self, payload: dict):
+        self.redis.lpush(self.queue_name, json.dumps(payload))
+    
+    def receive(self, max_messages: int = 1):
+        messages = []
+        for _ in range(max_messages):
+            message = self.redis.brpop(self.queue_name, timeout=1)
+            if message:
+                messages.append({
+                    'body': message[1].decode('utf-8'),
+                    'receipt_handle': message[0]  # Use the key as handle
+                })
+        return messages
+    
+    def ack(self, message):
+        # Redis auto-removes on brpop, no explicit ack needed
+        pass
+
+class SQSQueue(QueueBackend):
+    def __init__(self, queue_url: str):
+        self.sqs = boto3.client('sqs')
+        self.queue_url = queue_url
+    
+    def send(self, payload: dict):
+        self.sqs.send_message(
+            QueueUrl=self.queue_url,
+            MessageBody=json.dumps(payload)
+        )
+    
+    def receive(self, max_messages: int = 1):
+        response = self.sqs.receive_message(
+            QueueUrl=self.queue_url,
+            MaxNumberOfMessages=max_messages,
+            VisibilityTimeout=300  # 5 minutes
+        )
+        messages = []
+        for msg in response.get('Messages', []):
+            messages.append({
+                'body': msg['Body'],
+                'receipt_handle': msg['ReceiptHandle']
+            })
+        return messages
+    
+    def ack(self, message):
+        self.sqs.delete_message(
+            QueueUrl=self.queue_url,
+            ReceiptHandle=message['receipt_handle']
+        )
+
+def get_queue_backend() -> QueueBackend:
+    backend = os.getenv('QUEUE_BACKEND', 'redis')
+    if backend == 'redis':
+        return RedisQueue(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            queue_name=os.getenv('REDIS_QUEUE_NAME', 'document_jobs')
+        )
+    elif backend == 'sqs':
+        return SQSQueue(queue_url=os.getenv('SQS_QUEUE_URL'))
+    else:
+        raise ValueError(f"Unknown QUEUE_BACKEND: {backend}")
+
+# --- MINIMAL MODELS (Bridge to your DB without copying the app) ---
 
 # --- MINIMAL MODELS (Bridge to your DB without copying the app) ---
 Base = declarative_base()
@@ -343,18 +429,12 @@ def sanitize_metadata(metadata: dict) -> dict:
 
 # --- CONFIG & LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger("BatchWorker")
+log = logging.getLogger("ECSWorker")
 
-# Load DB URL from Env (Passed by Batch/Task Definition)
+# Load DB URL from Env (Always available in ECS)
 DATABASE_URL = os.getenv("DATABASE_URL")
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-
-if not TEST_MODE:
-    engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(bind=engine)
-else:
-    engine = None
-    SessionLocal = None
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 
 # Initialize LLM
 llm = ChatGroq(
@@ -367,27 +447,17 @@ llm = ChatGroq(
 # (All your helper functions: convert_docx_to_pdf, partition_document, 
 # separate_content_types, create_ai_enhanced_summary stay exactly the same as your local script)
 
-def process_document_single():
-    """Execution logic for a single AWS Batch Job"""
-    # 1. Get Task Metadata from Environment
-    project_id = os.getenv("PROJECT_ID")
-    file_id = os.getenv("FILE_ID")
-    s3_key = os.getenv("S3_PATH") # e.g., 'uploads/1/doc.pdf'
-    original_filename = os.getenv("ORIGINAL_FILENAME")
-    bucket_name = os.getenv("S3_BUCKET_NAME")
+def process_document_job(job: dict):
+    """Process a single document job from the queue"""
+    project_id = job['project_id']
+    file_id = job['file_id']
+    s3_key = job['s3_key']
+    original_filename = job['original_filename']
+    bucket_name = job['bucket_name']
 
-    if not all([project_id, file_id, s3_key]):
-        log.error("❌ Missing required environment variables.")
-        sys.exit(1)
-
-    if TEST_MODE:
-        db = None
-        db_file = None
-        log.info("🧪 TEST MODE: Skipping DB and ChromaDB operations")
-    else:
-        db: Session = SessionLocal()
-        # Query the file record first
-        db_file = db.query(File).filter(File.file_id == file_id).first()
+    db: Session = SessionLocal()
+    # Query the file record first
+    db_file = db.query(File).filter(File.file_id == file_id).first()
     
     try:
         # Download from S3 logic
@@ -400,7 +470,7 @@ def process_document_single():
         s3.download_file(bucket_name, s3_key, local_input_path)
 
         # Update DB Status
-        if not TEST_MODE and db_file:
+        if db_file:
             db_file.status = FileStatus.PARTITIONING
             db.commit()
 
@@ -418,12 +488,12 @@ def process_document_single():
         # 3. Export chunks to JSON in S3
         log.info("📄 Exporting chunks to JSON...")
         processed_path = export_chunks_to_json(processed_chunks, project_id, file_id, bucket_name)
-        if not TEST_MODE and processed_path and db_file:
+        if processed_path and db_file:
             db_file.processed_path = processed_path
             db.commit()
 
         # 4. Embedding
-        if not TEST_MODE:
+        if db_file:
             db_file.status = FileStatus.EMBEDDING
             db.commit()
         embedding_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
@@ -431,7 +501,7 @@ def process_document_single():
         embeddings = embedding_model.embed_documents(texts)
 
         # 5. ChromaDB Indexing
-        if not TEST_MODE:
+        if db_file:
             db_file.status = FileStatus.INDEXING
             db.commit()
             chroma_client = chromadb.HttpClient(host=os.getenv("CHROMA_HOST"), port=os.getenv("CHROMA_PORT"))
@@ -443,22 +513,63 @@ def process_document_single():
             collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
 
         # Finalize
-        if not TEST_MODE:
+        if db_file:
             db_file.status = FileStatus.COMPLETED
             db.commit()
         log.info("🎉 Job Finished Successfully")
 
     except Exception as e:
         log.error(f"❌ Job Failed: {str(e)}")
-        if not TEST_MODE and db_file:
+        if db_file:
             db_file.status = FileStatus.FAILED
             db_file.error_message = str(e)
             db.commit()
-        sys.exit(1)
+        raise  # Re-raise to let caller handle
     finally:
-        if not TEST_MODE:
-            db.close()
+        db.close()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+def worker_loop():
+    """Long-running worker loop that processes jobs from the queue"""
+    queue = get_queue_backend()
+    max_workers = int(os.getenv('MAX_WORKERS', 2))
+    
+    log.info(f"🚀 Starting worker loop with {max_workers} max workers")
+    log.info(f"📡 Queue backend: {os.getenv('QUEUE_BACKEND', 'redis')}")
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            try:
+                # Poll for messages
+                messages = queue.receive(max_messages=max_workers)
+                
+                if not messages:
+                    log.debug("📭 No messages in queue, sleeping...")
+                    time.sleep(5)
+                    continue
+                
+                log.info(f"📬 Received {len(messages)} messages")
+                
+                # Submit jobs to process pool
+                futures = []
+                for message in messages:
+                    job = json.loads(message['body'])
+                    future = executor.submit(process_document_job, job)
+                    futures.append((future, message))
+                
+                # Wait for completion and ack successful ones
+                for future, message in futures:
+                    try:
+                        future.result()  # Will raise if processing failed
+                        queue.ack(message)
+                        log.info("✅ Job completed and acknowledged")
+                    except Exception as e:
+                        log.error(f"❌ Job failed, not acknowledging: {str(e)}")
+                        # Don't ack failed messages, let them retry
+            
+            except Exception as e:
+                log.error(f"❌ Worker loop error: {str(e)}")
+                time.sleep(10)  # Back off on errors
+
 if __name__ == "__main__":
-    process_document_single()
+    worker_loop()

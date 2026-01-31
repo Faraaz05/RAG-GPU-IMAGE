@@ -1,99 +1,197 @@
-# AWS Batch Worker Testing
+# ECS GPU Worker for Vector Trace
+
+A long-running ECS worker that processes documents from a queue for RAG ingestion pipelines.
+
+## Architecture
+
+- **Queue-Driven**: Pulls jobs from Redis (local dev) or SQS (production)
+- **Parallel Processing**: Uses `ProcessPoolExecutor` with configurable `MAX_WORKERS`
+- **GPU-Accelerated**: Leverages NVIDIA GPUs for document processing
+- **ECS EC2 Launch Type**: Designed for long-running containerized workloads
 
 ## Prerequisites
 
-1. **Running Services**: Make sure your docker-compose services are running:
+1. **Running Services**: Ensure your docker-compose services are running:
    ```bash
    cd ..
    docker-compose up -d
    ```
 
-2. **Test PDF**: Place your test PDF as `RHCSAMOCK8.pdf` in this directory
-
-3. **Environment Variables**: Your `.env` file should contain:
-   - `DATABASE_URL` (points to localhost:5432)
+2. **Environment Variables**: Your `.env.worker` file should contain:
+   - `DATABASE_URL` (points to postgres service)
    - `GROQ_API_KEY`
    - `GOOGLE_API_KEY`
    - `S3_BUCKET_NAME`
-   - `CHROMA_HOST=localhost`
-   - `CHROMA_PORT=8001`
+   - `CHROMA_HOST=chromadb`
+   - `CHROMA_PORT=8000`
+   - `QUEUE_BACKEND=redis` (or `sqs`)
+   - `REDIS_HOST=redis` (for Redis backend)
+   - `SQS_QUEUE_URL=...` (for SQS backend)
+   - `MAX_WORKERS=2` (default: 2)
 
-## Networking Setup
+## Queue Backends
 
-The container uses `--network host` to access your local services:
+### Redis (Local Development)
+- Uses Redis lists for job queuing
+- Jobs are removed on receipt (no built-in retry)
+- Configure with: `QUEUE_BACKEND=redis`
 
-- **ChromaDB**: `localhost:8001` (from docker-compose)
-- **PostgreSQL**: `localhost:5432` (from docker-compose)
-- **Redis**: `localhost:6379` (from docker-compose)
-- **S3**: Via internet (AWS credentials needed)
+### SQS (Production)
+- Uses AWS SQS for reliable job queuing
+- Built-in retry with visibility timeouts
+- Configure with: `QUEUE_BACKEND=sqs`
+
+## Job Format
+
+Jobs are JSON payloads sent to the queue:
+
+```json
+{
+  "project_id": 1,
+  "file_id": "uuid-string",
+  "s3_key": "projects/1/raw/filename.pdf",
+  "original_filename": "document.pdf",
+  "bucket_name": "your-s3-bucket"
+}
+```
 
 ## Files Overview
 
-- `aws_gpu_worker.py` - The main AWS Batch worker script
+- `aws_gpu_worker.py` - The main ECS worker script
 - `Dockerfile` - Container definition for GPU processing
 - `requirements.txt` - Main Python dependencies
 - `requirements-missing.txt` - Missing unstructured dependencies (separate layer)
 - `test_container.sh` - Simple container test script
-- `mock_backend_test.py` - Complete end-to-end test (recommended)
+- `mock_backend_test.py` - End-to-end test (needs updating for queue-based workflow)
 
-## Quick Test (Simple)
-
-```bash
-# Build and test container
-./test_container.sh
-```
-
-## Full End-to-End Test (Recommended)
+## Quick Test
 
 ```bash
-# 1. Place your test PDF file here as "RHCSAMOCK8.pdf"
-cp /path/to/your/test.pdf ./RHCSAMOCK8.pdf
+# Build the worker image
+docker build -t ecs-gpu-worker .
 
-# 2. Run the mock backend test
-python mock_backend_test.py
+# Run with Redis backend (local dev)
+docker run --rm \
+  --env-file .env.worker \
+  --network host \
+  ecs-gpu-worker
+
+# Or with SQS backend (production)
+docker run --rm \
+  --env-file .env.worker \
+  ecs-gpu-worker
 ```
 
-## What the Mock Backend Does
+## Sending Test Jobs
 
-1. **Finds** the `RHCSAMOCK8.pdf` file in the current directory
-2. **Uploads** it to S3 using the same logic as your FastAPI backend
-3. **Runs** the Docker container with proper environment variables
-4. **Processes** the document through the full pipeline
-5. **Reports** success/failure
+### Via Redis (Local)
+```python
+import redis
+import json
 
-## Environment Variables Required
+r = redis.Redis(host='localhost', port=6379, db=0)
+job = {
+    "project_id": 1,
+    "file_id": "test-uuid",
+    "s3_key": "projects/1/raw/test.pdf",
+    "original_filename": "test.pdf",
+    "bucket_name": "your-bucket"
+}
+r.lpush('document_jobs', json.dumps(job))
+```
 
-Make sure your `.env` file contains:
-- `DATABASE_URL`
-- `GROQ_API_KEY`
-- `GOOGLE_API_KEY`
-- `S3_BUCKET_NAME`
-- `CHROMA_HOST` (defaults to localhost)
-- `CHROMA_PORT` (defaults to 8001 for docker-compose)
+### Via SQS (Production)
+```python
+import boto3
+import json
+
+sqs = boto3.client('sqs')
+job = {
+    "project_id": 1,
+    "file_id": "test-uuid",
+    "s3_key": "projects/1/raw/test.pdf",
+    "original_filename": "test.pdf",
+    "bucket_name": "your-bucket"
+}
+sqs.send_message(
+    QueueUrl='your-queue-url',
+    MessageBody=json.dumps(job)
+)
+```
 
 ## Expected Output
 
 ```
-🎯 Mock Backend - Testing AWS Batch Worker Container
-=======================================================
-📄 Finding test PDF...
-✅ Found test PDF: /path/to/RHCSAMOCK8.pdf
-☁️  Uploading to S3...
-✅ Uploaded to S3: s3://vector-trace-storage/projects/2/raw/12345678-1234-1234-1234-123456789abc.pdf
-🐳 Running AWS Batch worker container...
-🚀 Running AWS Batch container with command: ...
-📋 Environment variables: ...
-==================================================
-CONTAINER OUTPUT:
-==================================================
-📥 Downloading s3://vector-trace-storage/projects/2/raw/12345678-1234-1234-1234-123456789abc.pdf
-📄 Partitioning document: /tmp/.../12345678-1234-1234-1234-123456789abc.pdf
+🚀 Starting worker loop with 2 max workers
+📡 Queue backend: redis
+📬 Received 1 messages
+📥 Downloading s3://your-bucket/projects/1/raw/test.pdf
+📄 Partitioning document: /tmp/.../test.pdf
 🔨 Creating smart chunks...
 🚀 Starting LPU processing for X chunks...
+📄 Exporting chunks to JSON...
+✅ Exported X chunks to s3://your-bucket/projects/1/processed/test-uuid.json
 🎉 Job Finished Successfully
-
-🎉 Mock backend test completed successfully!
-📊 Processed file: 12345678-1234-1234-1234-123456789abc.pdf
-🆔 File ID: 12345678-1234-1234-1234-123456789abc
-📍 S3 Location: s3://vector-trace-storage/projects/2/raw/12345678-1234-1234-1234-123456789abc.pdf
+✅ Job completed and acknowledged
 ```
+
+## Environment Variables Required
+
+### Core
+- `DATABASE_URL` - PostgreSQL connection string
+- `GROQ_API_KEY` - For AI summarization
+- `GOOGLE_API_KEY` - For embeddings
+- `S3_BUCKET_NAME` - S3 bucket for files and processed data
+
+### Queue
+- `QUEUE_BACKEND` - `redis` or `sqs`
+- `REDIS_HOST` - Redis hostname (default: localhost)
+- `REDIS_PORT` - Redis port (default: 6379)
+- `REDIS_QUEUE_NAME` - Redis queue name (default: document_jobs)
+- `SQS_QUEUE_URL` - SQS queue URL
+
+### Services
+- `CHROMA_HOST` - ChromaDB hostname (default: localhost)
+- `CHROMA_PORT` - ChromaDB port (default: 8000)
+
+### Performance
+- `MAX_WORKERS` - Number of parallel workers (default: 2)
+
+## Deployment
+
+### Docker Compose (Local)
+```yaml
+version: '3.8'
+services:
+  worker:
+    image: ecs-gpu-worker:latest
+    env_file:
+      - .env.worker
+    depends_on:
+      - redis
+      - postgres
+      - chromadb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: always
+```
+
+### ECS Task Definition
+- Use EC2 launch type
+- Attach GPU instance types (e.g., p3, p4, g4dn)
+- Configure IAM role with SQS, S3, and ChromaDB permissions
+- Set environment variables as above
+- Use `ecs-gpu-worker:latest` image
+
+## Monitoring
+
+- Worker logs show job processing status
+- Check queue length for backlog
+- Monitor DB for file status updates
+- S3 for processed JSON outputs
+- ChromaDB for vector indexes

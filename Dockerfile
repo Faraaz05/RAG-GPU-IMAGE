@@ -30,10 +30,6 @@ RUN pip install --no-cache-dir --timeout=10000 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install missing unstructured dependencies (separate layer for faster rebuilds)
-COPY requirements-missing.txt .
-RUN pip install --no-cache-dir -r requirements-missing.txt
-
 RUN python3 -m pip uninstall -y pdfminer pdfminer-six
 
 COPY other.txt .
