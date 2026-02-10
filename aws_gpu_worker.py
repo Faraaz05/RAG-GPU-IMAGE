@@ -496,7 +496,7 @@ def process_document_job(job: dict):
         if db_file:
             db_file.status = FileStatus.EMBEDDING
             db.commit()
-        embedding_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        embedding_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
         texts = [doc.page_content for doc in processed_chunks]
         embeddings = embedding_model.embed_documents(texts)
 

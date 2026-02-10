@@ -35,11 +35,7 @@ RUN python3 -m pip uninstall -y pdfminer pdfminer-six
 COPY other.txt .
 RUN python3 -m pip install --no-cache-dir -r other.txt
 
-COPY warmup.py .
-COPY test_complex.pdf .
-
-# Run the warmup to trigger ~1.2GB of model downloads
-RUN python3 warmup.py && rm warmup.py test_complex.pdf
+RUN mkdir -p /root/.cache/huggingface
 
 # 5. Final Worker Script
 COPY aws_gpu_worker.py .
