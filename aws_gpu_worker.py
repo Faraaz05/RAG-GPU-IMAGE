@@ -71,7 +71,7 @@ class RedisQueue(QueueBackend):
 
 class SQSQueue(QueueBackend):
     def __init__(self, queue_url: str):
-        self.sqs = boto3.client('sqs')
+        self.sqs = boto3.client('sqs', region_name=os.getenv('AWS_REGION', 'ap-south-1'))
         self.queue_url = queue_url
     
     def send(self, payload: dict):
